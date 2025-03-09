@@ -327,3 +327,27 @@ class MoEFlexTokenLayer(nn.Layer):
             expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle, None
         )
         return output, l_aux, l_zloss
+
+    def gate_compute(self, hidden_states):
+        _, _, d_model = hidden_states.shape
+        # reshaped_input = hidden_states.reshape([-1, d_model])
+        probs, routing_map, l_aux, l_zloss = self.router(hidden_states)
+        return probs, routing_map, l_aux, l_zloss
+
+    def dispatch_comm(self, hidden_states, probs, routing_map):
+        (
+            dispatched_input,
+            tokens_per_expert,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+            handle,
+        ) = self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
+        return dispatched_input, tokens_per_expert, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle
+
+    def mlp_compute(self, dispatched_input, tokens_per_expert):
+        return self.expert_forward(dispatched_input, tokens_per_expert)
+
+    def combine_comm(self, expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle):
+        output, _ = self.token_dispatcher.token_unpermutation(expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle, None)
+        return output
