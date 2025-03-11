@@ -754,14 +754,14 @@ class AddAuxiliaryLoss(paddle.autograd.PyLayer):
         assert paddle.numel(loss) == 1
         ctx.dtype = loss.dtype
         ctx.required_aux_loss = not loss.stop_gradient
-        return x
+        return x.clone()
 
     @staticmethod
     def backward(ctx, grad_output):
         grad_loss = None
         if ctx.required_aux_loss:
             grad_loss = paddle.ones(1, dtype=ctx.dtype)
-        return grad_output, grad_loss
+        return grad_output.clone(), grad_loss
 
 
 class DeepseekV2MoE(MoELayer):
@@ -1173,7 +1173,7 @@ class DeepseekV2DecoderLayer(nn.Layer):
         self.input_layernorm = DeepseekV2RMSNorm(config)
         self.post_attention_layernorm = DeepseekV2RMSNorm(config)
 
-    def self_attn_and_gate_compute(
+    def self_attn_compute(
         self,
         hidden_states: paddle.Tensor,
         position_ids: Optional[paddle.Tensor] = None,
@@ -1184,22 +1184,45 @@ class DeepseekV2DecoderLayer(nn.Layer):
         attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
         **kwargs,
     ):
-        hidden_states, residual = self.self_attn_compute(
-            hidden_states,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-            **kwargs,
-        )
-        probs, routing_map, l_aux, l_zloss = self.mlp.gate_compute(hidden_states)
-        return probs, routing_map, l_aux, l_zloss
+        residual = hidden_states
 
-    def auxilibaryloss_and_shared_expert_compute(self, residual, hidden_states, expert_output, l_aux):
-        hidden_states = self.mlp.auxilibaryloss_and_shared_expert_compute(hidden_states, expert_output, l_aux)
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        has_gradient = not hidden_states.stop_gradient
+        if (
+            self.enable_recompute
+            and self.layerwise_recompute
+            and has_gradient
+            and self.recompute_granularity == "full_attn"
+        ):
+            hidden_states, self_attn_weights, present_key_value = recompute(
+                self.self_attn,
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+                **kwargs,
+            )
+        else:
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        return hidden_states, residual, self_attn_weights, present_key_value
 
     def post_process_output(self, hidden_states, output_attentions, use_cache, self_attn_weights, present_key_value):
         outputs = (hidden_states,)
@@ -1240,102 +1263,22 @@ class DeepseekV2DecoderLayer(nn.Layer):
                 (see `past_key_values`).
             past_key_value (`Tuple(paddle.Tensor)`, *optional*): cached past key and value projection states
         """
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        has_gradient = not hidden_states.stop_gradient
-        if (
-            self.enable_recompute
-            and self.layerwise_recompute
-            and has_gradient
-            and self.recompute_granularity == "full_attn"
-        ):
-            hidden_states, self_attn_weights, present_key_value = recompute(
-                self.self_attn,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                **kwargs,
-            )
-        else:
-            hidden_states, self_attn_weights, present_key_value = self.self_attn(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                **kwargs,
-            )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual, self_attn_weights, present_key_value = self.self_attn_compute(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+            **kwargs,
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return self.post_process_output(
             hidden_states, output_attentions, use_cache, self_attn_weights, present_key_value
         )
-
-    def self_attn_compute(
-        self,
-        hidden_states: paddle.Tensor,
-        position_ids: Optional[paddle.Tensor] = None,
-        attention_mask: Optional[paddle.Tensor] = None,
-        output_attentions: Optional[bool] = False,
-        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
-        use_cache: Optional[bool] = False,
-        attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
-        **kwargs
-    ):
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        has_gradient = not hidden_states.stop_gradient
-        if (
-            self.enable_recompute
-            and self.layerwise_recompute
-            and has_gradient
-            and self.recompute_granularity == "full_attn"
-        ):
-            hidden_states, self_attn_weights, present_key_value = recompute(
-                self.self_attn,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                **kwargs,
-            )
-        else:
-            hidden_states, self_attn_weights, present_key_value = self.self_attn(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                **kwargs,
-            )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return hidden_states, residual
 
 
 class DeepseekV2MTPLayer(DeepseekV2DecoderLayer):

@@ -20,7 +20,9 @@ import paddle.distributed.fleet as fleet
 import paddle.nn as nn
 from paddle.distributed.fleet.meta_parallel import (
     LayerDesc,
+    LocalSharedLayerDesc,
     PipelineLayer,
+    ScheduleNode,
     SharedLayerDesc,
 )
 from paddle.distributed.fleet.recompute.recompute import recompute
@@ -38,11 +40,6 @@ from .modeling import (
     DeepseekV2PretrainingCriterion,
     DeepseekV2RMSNorm,
 )
-
-try:
-    from paddle.distributed.fleet.meta_parallel import LocalSharedLayerDesc
-except:
-    LocalSharedLayerDesc = None
 
 __all__ = [
     "DeepseekV2ForCausalLMPipe",
@@ -99,6 +96,40 @@ def get_attr(layer, name):
         return getattr(layer, name, None)
     else:
         return get_attr(layer._layer, name)
+
+
+class TransformerLayerNode(ScheduleNode):
+    def __init__(
+        self, attn_node, dispatch_node, mlp_node, combine_node, post_process_node, name="TransformerLayerNode"
+    ):
+        super().__init__(fwd_func=None, name=name)
+        assert isinstance(attn_node, ScheduleNode)
+        assert isinstance(dispatch_node, ScheduleNode)
+        assert isinstance(mlp_node, ScheduleNode)
+        assert isinstance(combine_node, ScheduleNode)
+        assert isinstance(post_process_node, ScheduleNode)
+        self.attn_node = attn_node
+        self.dispatch_node = dispatch_node
+        self.mlp_node = mlp_node
+        self.combine_node = combine_node
+        self.post_process_node = post_process_node
+
+    def forward(self, inputs=()):
+        inputs = self.attn_node.forward(inputs)
+        inputs = self.dispatch_node.forward(inputs)
+        inputs = self.mlp_node.forward(inputs)
+        inputs = self.combine_node.forward(inputs)
+        inputs = self.post_process_node.forward(inputs)
+        return inputs
+
+    def backward(self, output_grad=None, scaler=None):
+        assert (output_grad is not None) and (scaler is None)
+        output_grad = self.post_process_node.backward(output_grad)
+        output_grad = self.combine_node.backward(output_grad)
+        output_grad = self.mlp_node.backward(output_grad)
+        output_grad = self.dispatch_node.backward(output_grad)
+        output_grad = self.attn_node.backward(output_grad)
+        return output_grad
 
 
 class DeepseekV2EmbeddingPipe(nn.Layer):
@@ -190,6 +221,9 @@ class DeepseekV2EmbeddingPipe(nn.Layer):
                 inputs_embeds = ScatterOp.apply(inputs_embeds)
             return return_args(inputs_embeds, attention_mask, attn_mask_startend_row_indices, position_ids)
 
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2EmbeddingPipe")
+
 
 class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
     def forward(self, args):
@@ -245,6 +279,87 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             hidden_states = paddle.concat([hidden_states, inputs_embeds_mtp])
 
         return return_args(hidden_states, attention_mask, attn_mask_startend_row_indices, position_ids)
+
+    def self_attn_and_gate_compute(self, args):
+        hidden_states, attention_mask, attn_mask_startend_row_indices, position_ids = parse_args(args)
+        assert attention_mask is None and attn_mask_startend_row_indices is None and position_ids is None
+        if self.config.num_nextn_predict_layers > 0:
+            batch_size, _, hidden_size = hidden_states.shape
+            batch_size_mtp = batch_size // (self.config.num_nextn_predict_layers + 1)
+            inputs_embeds_mtp = hidden_states[-batch_size_mtp:, :, :]
+            hidden_states = hidden_states[:batch_size_mtp, :, :]
+
+        hidden_states, residual, _, _ = self.self_attn_compute(
+            hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
+        )
+        probs, routing_map, l_aux, _ = self.mlp.gate_compute(hidden_states)
+        return (
+            inputs_embeds_mtp.clone(),
+            hidden_states,
+            residual.clone(),
+            probs.clone(),
+            routing_map.clone(),
+            l_aux.clone(),
+        )
+
+    def dispatch_comm(self, input):
+        if isinstance(input, list):
+            input = tuple(input)
+        (inputs_embeds_mtp, hidden_states, residual, probs, routing_map, l_aux) = input
+        dispatched_input, tokens_per_expert = self.mlp.dispatch_comm(hidden_states, probs, routing_map)
+        return (
+            inputs_embeds_mtp.clone(),
+            hidden_states,
+            residual.clone(),
+            l_aux.clone(),
+            dispatched_input,
+            tokens_per_expert,
+        )
+
+    def mlp_compute(self, input):
+        if isinstance(input, list):
+            input = tuple(input)
+        (inputs_embeds_mtp, hidden_states, residual, l_aux, dispatched_input, tokens_per_expert) = input
+        expert_output = self.mlp.mlp_compute(dispatched_input, tokens_per_expert)
+        return (inputs_embeds_mtp.clone(), hidden_states.clone(), residual.clone(), l_aux.clone(), expert_output)
+
+    def combine_comm(self, input):
+        if isinstance(input, list):
+            input = tuple(input)
+        (inputs_embeds_mtp, hidden_states, residual, l_aux, expert_output) = input
+        combine_output = self.mlp.combine_comm(expert_output)
+        return (inputs_embeds_mtp.clone(), hidden_states.clone(), residual.clone(), l_aux.clone(), combine_output)
+
+    def post_process_compute(self, input):
+        if isinstance(input, list):
+            input = tuple(input)
+        (inputs_embeds_mtp, hidden_states, residual, l_aux, combine_output) = input
+        hidden_states = self.mlp.auxilibaryloss_and_shared_expert_compute(hidden_states, combine_output, l_aux)
+        hidden_states = residual + hidden_states
+        hidden_states = self.post_process_output(hidden_states, False, False, None, None)
+        if self.config.num_nextn_predict_layers > 0:
+            hidden_states = paddle.concat([hidden_states, inputs_embeds_mtp])
+
+        return return_args(hidden_states)
+
+    # def build_schedule_node(self):
+    #     attn_and_gate_node = ScheduleNode(self.self_attn_and_gate_compute, name="attn_and_gate_node")
+    #     dispatch_node = ScheduleNode(self.dispatch_comm, name="dispatch_node")
+    #     mlp_node = ScheduleNode(self.mlp_compute, name="mlp_node")
+    #     combine_node = ScheduleNode(self.combine_comm, name="combine_node")
+    #     post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
+    #     return TransformerLayerNode(
+    #         attn_node = attn_and_gate_node,
+    #         dispatch_node = dispatch_node,
+    #         mlp_node = mlp_node,
+    #         combine_node = combine_node,
+    #         post_process_node = post_process_node,
+    #         name="DeepseekV2DecoderLayerPipe")
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2DecoderLayerPipe")
 
 
 class DeepseekV2MTPLayerPipe(DeepseekV2MTPLayer):
@@ -305,6 +420,9 @@ class DeepseekV2MTPLayerPipe(DeepseekV2MTPLayer):
         hidden_states = paddle.concat(output_list)
         return return_args(hidden_states, attention_mask, attn_mask_startend_row_indices, position_ids)
 
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2MTPLayerPipe")
+
 
 class DeepseekV2RMSNormPipe(nn.Layer):
     def __init__(self, config):
@@ -327,6 +445,9 @@ class DeepseekV2RMSNormPipe(nn.Layer):
         else:
             return self.norm(hidden_states)
 
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2RMSNormPipe")
+
 
 class DeepseekV2LMHeadPipe(DeepseekV2LMHead):
     def __init__(self, config, embedding_weight=None):
@@ -346,6 +467,9 @@ class DeepseekV2LMHeadPipe(DeepseekV2LMHead):
         logits = super().forward(hidden_states)
         return logits
 
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2LMHeadPipe")
+
 
 class DeepseekV2PretrainingCriterionPipe(DeepseekV2PretrainingCriterion):
     def forward(self, logits, labels):
@@ -356,6 +480,9 @@ class DeepseekV2PretrainingCriterionPipe(DeepseekV2PretrainingCriterion):
         else:
             loss = super().forward(logits, labels)
         return loss
+
+    def build_schedule_node(self):
+        return ScheduleNode(self.forward, name="DeepseekV2PretrainingCriterionPipe")
 
 
 class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
@@ -512,36 +639,26 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
 
     def overlapped_forward_backward(
         self,
-        module0,  # the module of the forward chunk
-        inputs0,
-        criterion0,
-        labels0,
-        module1,  # the module of the backward chunk, maybe not used
-        loss1,
-        outputs1,
-        output_grads1,
+        forward_chunk,  # the module of the forward chunk
+        forward_inputs,
+        forward_loss_fn_node,
+        backward_chunk,  # the module of the backward chunk, maybe not used
+        backward_loss_fn_node,
+        backward_input_grads,
         scaler,
     ):
-        outputs0 = inputs0
-        for layer in module0:
-            outputs0 = layer(outputs0)
+        forward_outputs = forward_chunk.forward(forward_inputs)
+        forward_outputs = [forward_outputs] if isinstance(forward_outputs, paddle.Tensor) else forward_outputs
 
-        outputs0 = [outputs0] if isinstance(outputs0, paddle.Tensor) else outputs0
-
-        if labels0 is not None:
-            loss0 = criterion0(outputs0, labels0)
+        if forward_loss_fn_node is not None:
+            forward_loss = forward_loss_fn_node.forward(forward_outputs)
         else:
-            loss0 = None
+            forward_loss = None
 
-        if loss1 is not None:
+        if backward_loss_fn_node is not None:
             if scaler:
-                paddle.autograd.backward(scaler.scale(loss1))
+                backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
             else:
-                paddle.autograd.backward(loss1)
-        else:
-            paddle.autograd.backward(
-                tensors=outputs1,
-                grad_tensors=output_grads1,
-            )
-
-        return outputs0, loss0
+                backward_input_grads = backward_loss_fn_node.backward()
+        backward_input_grads = backward_chunk.backward(backward_input_grads)
+        return forward_outputs, forward_loss, backward_input_grads
