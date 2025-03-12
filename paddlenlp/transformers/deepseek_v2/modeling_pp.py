@@ -22,6 +22,7 @@ from paddle.distributed.fleet.meta_parallel import (
     LayerDesc,
     LocalSharedLayerDesc,
     PipelineLayer,
+    ScheduleChunk,
     ScheduleNode,
     SharedLayerDesc,
 )
@@ -114,7 +115,7 @@ class TransformerLayerNode(ScheduleNode):
         self.combine_node = combine_node
         self.post_process_node = post_process_node
 
-    def forward(self, inputs=()):
+    def forward(self, inputs):
         inputs = self.attn_node.forward(inputs)
         inputs = self.dispatch_node.forward(inputs)
         inputs = self.mlp_node.forward(inputs)
@@ -130,6 +131,31 @@ class TransformerLayerNode(ScheduleNode):
         output_grad = self.dispatch_node.backward(output_grad)
         output_grad = self.attn_node.backward(output_grad)
         return output_grad
+
+
+class OverlapChunk:
+    def __init__(self, forward_nodes, backward_nodes):
+        assert len(forward_nodes) == len(backward_nodes)
+        self.nodes = []
+        for f, b in zip(forward_nodes, backward_nodes):
+            self.nodes.append(OverlapNode(f, b, f"OverlapNode_{len(self.nodes)}"))
+
+    def forward_backward(self, inputs, output_grad):
+        for n in self.nodes:
+            inputs, output_grad = n.forward_backward(inputs, output_grad)
+        return inputs, output_grad
+
+
+class OverlapNode:
+    def __init__(self, forward_node, backward_node, name=""):
+        self.forward_node = forward_node
+        self.backward_node = backward_node
+        self.name = name
+
+    def forward_backward(self, inputs, output_grad):
+        output_grad = self.backward_node.backward(output_grad)
+        inputs = self.forward_node.forward(inputs)
+        return inputs, output_grad
 
 
 class DeepseekV2EmbeddingPipe(nn.Layer):
@@ -297,12 +323,12 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         )
         probs, routing_map, l_aux, _ = self.mlp.gate_compute(hidden_states)
         return (
-            inputs_embeds_mtp.clone(),
+            inputs_embeds_mtp,
             hidden_states,
-            residual.clone(),
-            probs.clone(),
-            routing_map.clone(),
-            l_aux.clone(),
+            residual,
+            probs,
+            routing_map,
+            l_aux,
         )
 
     def dispatch_comm(self, input):
@@ -311,10 +337,10 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         (inputs_embeds_mtp, hidden_states, residual, probs, routing_map, l_aux) = input
         dispatched_input, tokens_per_expert = self.mlp.dispatch_comm(hidden_states, probs, routing_map)
         return (
-            inputs_embeds_mtp.clone(),
+            inputs_embeds_mtp,
             hidden_states,
-            residual.clone(),
-            l_aux.clone(),
+            residual,
+            l_aux,
             dispatched_input,
             tokens_per_expert,
         )
@@ -324,14 +350,14 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             input = tuple(input)
         (inputs_embeds_mtp, hidden_states, residual, l_aux, dispatched_input, tokens_per_expert) = input
         expert_output = self.mlp.mlp_compute(dispatched_input, tokens_per_expert)
-        return (inputs_embeds_mtp.clone(), hidden_states.clone(), residual.clone(), l_aux.clone(), expert_output)
+        return (inputs_embeds_mtp, hidden_states, residual, l_aux, expert_output)
 
     def combine_comm(self, input):
         if isinstance(input, list):
             input = tuple(input)
         (inputs_embeds_mtp, hidden_states, residual, l_aux, expert_output) = input
         combine_output = self.mlp.combine_comm(expert_output)
-        return (inputs_embeds_mtp.clone(), hidden_states.clone(), residual.clone(), l_aux.clone(), combine_output)
+        return (inputs_embeds_mtp, hidden_states, residual, l_aux, combine_output)
 
     def post_process_compute(self, input):
         if isinstance(input, list):
@@ -345,21 +371,23 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
 
         return return_args(hidden_states)
 
-    # def build_schedule_node(self):
-    #     attn_and_gate_node = ScheduleNode(self.self_attn_and_gate_compute, name="attn_and_gate_node")
-    #     dispatch_node = ScheduleNode(self.dispatch_comm, name="dispatch_node")
-    #     mlp_node = ScheduleNode(self.mlp_compute, name="mlp_node")
-    #     combine_node = ScheduleNode(self.combine_comm, name="combine_node")
-    #     post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
-    #     return TransformerLayerNode(
-    #         attn_node = attn_and_gate_node,
-    #         dispatch_node = dispatch_node,
-    #         mlp_node = mlp_node,
-    #         combine_node = combine_node,
-    #         post_process_node = post_process_node,
-    #         name="DeepseekV2DecoderLayerPipe")
     def build_schedule_node(self):
-        return ScheduleNode(self.forward, name="DeepseekV2DecoderLayerPipe")
+        attn_and_gate_node = ScheduleNode(self.self_attn_and_gate_compute, name="attn_and_gate_node")
+        dispatch_node = ScheduleNode(self.dispatch_comm, name="dispatch_node")
+        mlp_node = ScheduleNode(self.mlp_compute, name="mlp_node")
+        combine_node = ScheduleNode(self.combine_comm, name="combine_node")
+        post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
+        return TransformerLayerNode(
+            attn_node=attn_and_gate_node,
+            dispatch_node=dispatch_node,
+            mlp_node=mlp_node,
+            combine_node=combine_node,
+            post_process_node=post_process_node,
+            name="DeepseekV2DecoderLayerPipe",
+        )
+
+    # def build_schedule_node(self):
+    #     return ScheduleNode(self.forward, name="DeepseekV2DecoderLayerPipe")
 
 
 class DeepseekV2MTPLayerPipe(DeepseekV2MTPLayer):
@@ -637,7 +665,61 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     def get_loss_fn(self, config):
         return DeepseekV2PretrainingCriterionPipe(config)
 
-    def overlapped_forward_backward(
+    def build_overlapped_nodes(self, forward_chunk, backward_chunk):
+        forward_decoder_layer_num = 0
+        backward_decoder_layer_num = 0
+        assert isinstance(forward_chunk, ScheduleChunk) and isinstance(backward_chunk, ScheduleChunk)
+        for n in forward_chunk.nodes:
+            if isinstance(n, TransformerLayerNode):
+                forward_decoder_layer_num += 1
+        for n in reversed(backward_chunk.nodes):
+            if isinstance(n, TransformerLayerNode):
+                backward_decoder_layer_num += 1
+
+        overlap_layers_num = min(forward_decoder_layer_num, backward_decoder_layer_num)
+        forward_pre_overlap_layers = []
+        forward_post_overlap_layers = []
+        forward_overlap_layers = []
+        is_pre = True
+        for n in forward_chunk.nodes:
+            if not isinstance(n, TransformerLayerNode):
+                if is_pre:
+                    forward_pre_overlap_layers.append(n)
+                else:
+                    forward_post_overlap_layers.append(n)
+            else:
+                is_pre = False
+                if len(forward_overlap_layers) == overlap_layers_num:
+                    forward_post_overlap_layers.append(n)
+                else:
+                    forward_overlap_layers.append(n)
+        forward_pre_node = ScheduleChunk(forward_pre_overlap_layers)
+        forward_post_node = ScheduleChunk(forward_post_overlap_layers)
+
+        backward_pre_overlap_layers = []
+        backward_post_overlap_layers = []
+        backward_overlap_layers = []
+        is_pre = True
+        for n in reversed(backward_chunk.nodes):
+            if not isinstance(n, TransformerLayerNode):
+                if is_pre:
+                    backward_pre_overlap_layers.append(n)
+                else:
+                    backward_post_overlap_layers.append(n)
+            else:
+                is_pre = False
+                if len(backward_overlap_layers) == overlap_layers_num:
+                    backward_post_overlap_layers.append(n)
+                else:
+                    backward_overlap_layers.append(n)
+
+        backward_pre_node = ScheduleChunk(list(reversed(backward_pre_overlap_layers)))
+        backward_post_node = ScheduleChunk(list(reversed(backward_post_overlap_layers)))
+
+        overlap_node = OverlapChunk(forward_overlap_layers, backward_overlap_layers)
+        return forward_pre_node, backward_pre_node, overlap_node, forward_post_node, backward_post_node
+
+    def _overlapped_forward_backward(
         self,
         forward_chunk,  # the module of the forward chunk
         forward_inputs,
@@ -662,3 +744,39 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
                 backward_input_grads = backward_loss_fn_node.backward()
         backward_input_grads = backward_chunk.backward(backward_input_grads)
         return forward_outputs, forward_loss, backward_input_grads
+
+    def overlapped_forward_backward(
+        self,
+        forward_chunk,  # the module of the forward chunk
+        forward_inputs,
+        forward_loss_fn_node,
+        backward_chunk,  # the module of the backward chunk, maybe not used
+        backward_loss_fn_node,
+        backward_input_grads,
+        scaler,
+    ):
+        if backward_loss_fn_node is not None:
+            if scaler:
+                backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
+            else:
+                backward_input_grads = backward_loss_fn_node.backward()
+
+        (
+            forward_pre_node,
+            backward_pre_node,
+            overlap_node,
+            forward_post_node,
+            backward_post_node,
+        ) = self.build_overlapped_nodes(forward_chunk, backward_chunk)
+        forward_inputs = forward_pre_node.forward(forward_inputs)
+        backward_input_grads = backward_pre_node.backward(backward_input_grads)
+        forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
+        forward_inputs = forward_post_node.forward(forward_inputs)
+        backward_input_grads = backward_post_node.backward(backward_input_grads)
+
+        if forward_loss_fn_node is not None:
+            forward_loss = forward_loss_fn_node.forward(forward_inputs)
+        else:
+            forward_loss = None
+
+        return forward_inputs, forward_loss, backward_input_grads
