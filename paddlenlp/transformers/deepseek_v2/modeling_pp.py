@@ -101,22 +101,22 @@ def get_attr(layer, name):
 
 class TransformerLayerNode(ScheduleNode):
     def __init__(
-        self, attn_node, dispatch_node, mlp_node, combine_node, post_process_node, name="TransformerLayerNode"
+        self, attn_and_gate_node, dispatch_node, mlp_node, combine_node, post_process_node, name="TransformerLayerNode"
     ):
         super().__init__(fwd_func=None, name=name)
-        assert isinstance(attn_node, ScheduleNode)
+        assert isinstance(attn_and_gate_node, ScheduleNode)
         assert isinstance(dispatch_node, ScheduleNode)
         assert isinstance(mlp_node, ScheduleNode)
         assert isinstance(combine_node, ScheduleNode)
         assert isinstance(post_process_node, ScheduleNode)
-        self.attn_node = attn_node
+        self.attn_and_gate_node = attn_and_gate_node
         self.dispatch_node = dispatch_node
         self.mlp_node = mlp_node
         self.combine_node = combine_node
         self.post_process_node = post_process_node
 
     def forward(self, inputs):
-        inputs = self.attn_node.forward(inputs)
+        inputs = self.attn_and_gate_node.forward(inputs)
         inputs = self.dispatch_node.forward(inputs)
         inputs = self.mlp_node.forward(inputs)
         inputs = self.combine_node.forward(inputs)
@@ -129,7 +129,7 @@ class TransformerLayerNode(ScheduleNode):
         output_grad = self.combine_node.backward(output_grad)
         output_grad = self.mlp_node.backward(output_grad)
         output_grad = self.dispatch_node.backward(output_grad)
-        output_grad = self.attn_node.backward(output_grad)
+        output_grad = self.attn_and_gate_node.backward(output_grad)
         return output_grad
 
 
@@ -148,13 +148,29 @@ class OverlapChunk:
 
 class OverlapNode:
     def __init__(self, forward_node, backward_node, name=""):
+        assert isinstance(forward_node, TransformerLayerNode) and isinstance(backward_node, TransformerLayerNode)
         self.forward_node = forward_node
         self.backward_node = backward_node
         self.name = name
 
     def forward_backward(self, inputs, output_grad):
-        output_grad = self.backward_node.backward(output_grad)
-        inputs = self.forward_node.forward(inputs)
+        print("fwdbwd OverlapNode")
+        # output_grad = self.backward_node.backward(output_grad)
+        # inputs = self.forward_node.forward(inputs)
+        output_grad = self.backward_node.post_process_node.backward(output_grad)
+        output_grad = self.backward_node.combine_node.backward(output_grad)
+
+        inputs = self.forward_node.attn_and_gate_node.forward(inputs)
+        inputs = self.forward_node.dispatch_node.forward(inputs)
+
+        output_grad = self.backward_node.mlp_node.backward(output_grad)
+        output_grad = self.backward_node.dispatch_node.backward(output_grad)
+
+        inputs = self.forward_node.mlp_node.forward(inputs)
+        inputs = self.forward_node.combine_node.forward(inputs)
+
+        output_grad = self.backward_node.attn_and_gate_node.backward(output_grad)
+        inputs = self.forward_node.post_process_node.forward(inputs)
         return inputs, output_grad
 
 
@@ -378,7 +394,7 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         combine_node = ScheduleNode(self.combine_comm, name="combine_node")
         post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
         return TransformerLayerNode(
-            attn_node=attn_and_gate_node,
+            attn_and_gate_node=attn_and_gate_node,
             dispatch_node=dispatch_node,
             mlp_node=mlp_node,
             combine_node=combine_node,
@@ -718,32 +734,6 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
 
         overlap_node = OverlapChunk(forward_overlap_layers, backward_overlap_layers)
         return forward_pre_node, backward_pre_node, overlap_node, forward_post_node, backward_post_node
-
-    def _overlapped_forward_backward(
-        self,
-        forward_chunk,  # the module of the forward chunk
-        forward_inputs,
-        forward_loss_fn_node,
-        backward_chunk,  # the module of the backward chunk, maybe not used
-        backward_loss_fn_node,
-        backward_input_grads,
-        scaler,
-    ):
-        forward_outputs = forward_chunk.forward(forward_inputs)
-        forward_outputs = [forward_outputs] if isinstance(forward_outputs, paddle.Tensor) else forward_outputs
-
-        if forward_loss_fn_node is not None:
-            forward_loss = forward_loss_fn_node.forward(forward_outputs)
-        else:
-            forward_loss = None
-
-        if backward_loss_fn_node is not None:
-            if scaler:
-                backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
-            else:
-                backward_input_grads = backward_loss_fn_node.backward()
-        backward_input_grads = backward_chunk.backward(backward_input_grads)
-        return forward_outputs, forward_loss, backward_input_grads
 
     def overlapped_forward_backward(
         self,
