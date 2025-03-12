@@ -403,7 +403,13 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         if isinstance(input, list):
             input = tuple(input)
         (inputs_embeds_mtp, hidden_states, residual, probs, routing_map, l_aux) = input
-        dispatched_input, tokens_per_expert = self.mlp.dispatch_comm(hidden_states, probs, routing_map)
+        (
+            dispatched_input,
+            tokens_per_expert,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+        ) = self.mlp.dispatch_comm(hidden_states, probs, routing_map)
         return (
             inputs_embeds_mtp,
             hidden_states,
@@ -411,20 +417,53 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             l_aux,
             dispatched_input,
             tokens_per_expert,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
         )
 
     def mlp_compute(self, input):
         if isinstance(input, list):
             input = tuple(input)
-        (inputs_embeds_mtp, hidden_states, residual, l_aux, dispatched_input, tokens_per_expert) = input
+        (
+            inputs_embeds_mtp,
+            hidden_states,
+            residual,
+            l_aux,
+            dispatched_input,
+            tokens_per_expert,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+        ) = input
         expert_output = self.mlp.mlp_compute(dispatched_input, tokens_per_expert)
-        return (inputs_embeds_mtp, hidden_states, residual, l_aux, expert_output)
+        return (
+            inputs_embeds_mtp,
+            hidden_states,
+            residual,
+            l_aux,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+            expert_output,
+        )
 
     def combine_comm(self, input):
         if isinstance(input, list):
             input = tuple(input)
-        (inputs_embeds_mtp, hidden_states, residual, l_aux, expert_output) = input
-        combine_output = self.mlp.combine_comm(expert_output)
+        (
+            inputs_embeds_mtp,
+            hidden_states,
+            residual,
+            l_aux,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+            expert_output,
+        ) = input
+        combine_output = self.mlp.combine_comm(
+            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs
+        )
         return (inputs_embeds_mtp, hidden_states, residual, l_aux, combine_output)
 
     def post_process_compute(self, input):

@@ -65,12 +65,12 @@ class _DeepepManager:
         hidden_states, dispatched_probs, states = fused_dispatch(
             hidden_states, token_indices, token_probs, self.num_experts, self.group
         )
-        handle = states["handle"]
+        self.handle = states["handle"]
         tokens_per_expert = states["tokens_per_expert"]
         dispatched_indices = states["dispatched_indices"]
         dispatched_probs = dispatched_probs
 
-        return hidden_states, handle, tokens_per_expert, dispatched_indices, dispatched_probs
+        return hidden_states, tokens_per_expert, dispatched_indices, dispatched_probs
 
     def _indices_to_multihot(self, indices, probs):
         """
@@ -97,8 +97,8 @@ class _DeepepManager:
         multihot_probs[row_indices, valid_indices] = probs[mask]
         return multihot_routing_map.cast(paddle.bool), multihot_probs
 
-    def combine(self, hidden_states: paddle.Tensor, handle: paddle.Tensor) -> paddle.Tensor:
-        hidden_states = fused_combine(hidden_states, self.group, handle)
+    def combine(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
+        hidden_states = fused_combine(hidden_states, self.group, self.handle)
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(
@@ -168,7 +168,7 @@ class MoEFlexTokenDispatcher:
         # Convert the format of routing map from multihot to indices.
         token_probs, token_indices = paddle.topk(probs, self._comm_manager.router_topk, axis=-1)
 
-        hidden_states, handle, tokens_per_expert, dispatched_indices, dispatched_probs = self._comm_manager.dispatch(
+        hidden_states, tokens_per_expert, dispatched_indices, dispatched_probs = self._comm_manager.dispatch(
             hidden_states, token_indices, token_probs
         )
         (
@@ -186,7 +186,6 @@ class MoEFlexTokenDispatcher:
             reversed_mapping_for_combine,
             dispatched_routing_map,
             dispatched_probs,
-            handle,
         )
 
     def token_unpermutation(
@@ -195,14 +194,13 @@ class MoEFlexTokenDispatcher:
         reversed_mapping_for_combine,
         dispatched_routing_map,
         dispatched_probs,
-        handle,
         bias: Optional[paddle.Tensor] = None,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor]]:
         assert bias is None, "Bias is not supported in MoEFlexTokenDispatcher"
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(
             hidden_states, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs
         )
-        hidden_states = self._comm_manager.combine(hidden_states, handle)
+        hidden_states = self._comm_manager.combine(hidden_states)
 
         hidden_states = hidden_states.reshape(self.hidden_shape)
         return hidden_states, None

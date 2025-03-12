@@ -320,11 +320,10 @@ class MoEFlexTokenLayer(nn.Layer):
             reversed_mapping_for_combine,
             dispatched_routing_map,
             dispatched_probs,
-            handle,
         ) = self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
         expert_output = self.expert_forward(dispatched_input, tokens_per_expert)
         output, _ = self.token_dispatcher.token_unpermutation(
-            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle, None
+            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, None
         )
         return output, l_aux, l_zloss
 
@@ -341,13 +340,20 @@ class MoEFlexTokenLayer(nn.Layer):
             reversed_mapping_for_combine,
             dispatched_routing_map,
             dispatched_probs,
-            handle,
         ) = self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
-        return dispatched_input, tokens_per_expert, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle
+        return (
+            dispatched_input,
+            tokens_per_expert,
+            reversed_mapping_for_combine,
+            dispatched_routing_map,
+            dispatched_probs,
+        )
 
     def mlp_compute(self, dispatched_input, tokens_per_expert):
         return self.expert_forward(dispatched_input, tokens_per_expert)
 
-    def combine_comm(self, expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle):
-        output, _ = self.token_dispatcher.token_unpermutation(expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, handle, None)
+    def combine_comm(self, expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs):
+        output, _ = self.token_dispatcher.token_unpermutation(
+            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, None
+        )
         return output
