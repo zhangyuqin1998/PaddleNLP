@@ -133,12 +133,12 @@ class TransformerLayerNode(ScheduleNode):
         return output_grad
 
 
-class OverlapChunk:
+class OverlapedScheduleChunk:
     def __init__(self, forward_nodes, backward_nodes):
         assert len(forward_nodes) == len(backward_nodes)
         self.nodes = []
         for f, b in zip(forward_nodes, backward_nodes):
-            self.nodes.append(OverlapNode(f, b, f"OverlapNode_{len(self.nodes)}"))
+            self.nodes.append(OverlapedScheduleNode(f, b, f"OverlapedScheduleNode_{len(self.nodes)}"))
 
     def forward_backward(self, inputs, output_grad):
         for n in self.nodes:
@@ -146,7 +146,7 @@ class OverlapChunk:
         return inputs, output_grad
 
 
-class OverlapNode:
+class OverlapedScheduleNode:
     def __init__(self, forward_node, backward_node, name=""):
         assert isinstance(forward_node, TransformerLayerNode) and isinstance(backward_node, TransformerLayerNode)
         self.forward_node = forward_node
@@ -169,6 +169,61 @@ class OverlapNode:
         output_grad = self.backward_node.attn_and_gate_node.backward(output_grad)
         inputs = self.forward_node.post_process_node.forward(inputs)
         return inputs, output_grad
+
+
+def build_overlapped_nodes(forward_chunk, backward_chunk):
+    forward_decoder_layer_num = 0
+    backward_decoder_layer_num = 0
+    assert isinstance(forward_chunk, ScheduleChunk) and isinstance(backward_chunk, ScheduleChunk)
+    for n in forward_chunk.nodes:
+        if isinstance(n, TransformerLayerNode):
+            forward_decoder_layer_num += 1
+    for n in reversed(backward_chunk.nodes):
+        if isinstance(n, TransformerLayerNode):
+            backward_decoder_layer_num += 1
+
+    overlap_layers_num = min(forward_decoder_layer_num, backward_decoder_layer_num)
+    forward_pre_overlap_layers = []
+    forward_post_overlap_layers = []
+    forward_overlap_layers = []
+    is_pre = True
+    for n in forward_chunk.nodes:
+        if not isinstance(n, TransformerLayerNode):
+            if is_pre:
+                forward_pre_overlap_layers.append(n)
+            else:
+                forward_post_overlap_layers.append(n)
+        else:
+            is_pre = False
+            if len(forward_overlap_layers) == overlap_layers_num:
+                forward_post_overlap_layers.append(n)
+            else:
+                forward_overlap_layers.append(n)
+    forward_pre_node = ScheduleChunk(forward_pre_overlap_layers)
+    forward_post_node = ScheduleChunk(forward_post_overlap_layers)
+
+    backward_pre_overlap_layers = []
+    backward_post_overlap_layers = []
+    backward_overlap_layers = []
+    is_pre = True
+    for n in reversed(backward_chunk.nodes):
+        if not isinstance(n, TransformerLayerNode):
+            if is_pre:
+                backward_pre_overlap_layers.append(n)
+            else:
+                backward_post_overlap_layers.append(n)
+        else:
+            is_pre = False
+            if len(backward_overlap_layers) == overlap_layers_num:
+                backward_post_overlap_layers.append(n)
+            else:
+                backward_overlap_layers.append(n)
+
+    backward_pre_node = ScheduleChunk(list(reversed(backward_pre_overlap_layers)))
+    backward_post_node = ScheduleChunk(list(reversed(backward_post_overlap_layers)))
+
+    overlap_node = OverlapedScheduleChunk(forward_overlap_layers, backward_overlap_layers)
+    return forward_pre_node, backward_pre_node, overlap_node, forward_post_node, backward_post_node
 
 
 class DeepseekV2EmbeddingPipe(nn.Layer):
@@ -678,61 +733,7 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     def get_loss_fn(self, config):
         return DeepseekV2PretrainingCriterionPipe(config)
 
-    def build_overlapped_nodes(self, forward_chunk, backward_chunk):
-        forward_decoder_layer_num = 0
-        backward_decoder_layer_num = 0
-        assert isinstance(forward_chunk, ScheduleChunk) and isinstance(backward_chunk, ScheduleChunk)
-        for n in forward_chunk.nodes:
-            if isinstance(n, TransformerLayerNode):
-                forward_decoder_layer_num += 1
-        for n in reversed(backward_chunk.nodes):
-            if isinstance(n, TransformerLayerNode):
-                backward_decoder_layer_num += 1
-
-        overlap_layers_num = min(forward_decoder_layer_num, backward_decoder_layer_num)
-        forward_pre_overlap_layers = []
-        forward_post_overlap_layers = []
-        forward_overlap_layers = []
-        is_pre = True
-        for n in forward_chunk.nodes:
-            if not isinstance(n, TransformerLayerNode):
-                if is_pre:
-                    forward_pre_overlap_layers.append(n)
-                else:
-                    forward_post_overlap_layers.append(n)
-            else:
-                is_pre = False
-                if len(forward_overlap_layers) == overlap_layers_num:
-                    forward_post_overlap_layers.append(n)
-                else:
-                    forward_overlap_layers.append(n)
-        forward_pre_node = ScheduleChunk(forward_pre_overlap_layers)
-        forward_post_node = ScheduleChunk(forward_post_overlap_layers)
-
-        backward_pre_overlap_layers = []
-        backward_post_overlap_layers = []
-        backward_overlap_layers = []
-        is_pre = True
-        for n in reversed(backward_chunk.nodes):
-            if not isinstance(n, TransformerLayerNode):
-                if is_pre:
-                    backward_pre_overlap_layers.append(n)
-                else:
-                    backward_post_overlap_layers.append(n)
-            else:
-                is_pre = False
-                if len(backward_overlap_layers) == overlap_layers_num:
-                    backward_post_overlap_layers.append(n)
-                else:
-                    backward_overlap_layers.append(n)
-
-        backward_pre_node = ScheduleChunk(list(reversed(backward_pre_overlap_layers)))
-        backward_post_node = ScheduleChunk(list(reversed(backward_post_overlap_layers)))
-
-        overlap_node = OverlapChunk(forward_overlap_layers, backward_overlap_layers)
-        return forward_pre_node, backward_pre_node, overlap_node, forward_post_node, backward_post_node
-
-    def overlapped_forward_backward(
+    def _overlapped_forward_backward(
         self,
         forward_chunk,  # the module of the forward chunk
         forward_inputs,
@@ -754,7 +755,7 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
             overlap_node,
             forward_post_node,
             backward_post_node,
-        ) = self.build_overlapped_nodes(forward_chunk, backward_chunk)
+        ) = build_overlapped_nodes(forward_chunk, backward_chunk)
         forward_inputs = forward_pre_node.forward(forward_inputs)
         backward_input_grads = backward_pre_node.backward(backward_input_grads)
         forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
