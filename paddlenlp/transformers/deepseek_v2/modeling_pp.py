@@ -154,9 +154,6 @@ class OverlapNode:
         self.name = name
 
     def forward_backward(self, inputs, output_grad):
-        print("fwdbwd OverlapNode")
-        # output_grad = self.backward_node.backward(output_grad)
-        # inputs = self.forward_node.forward(inputs)
         output_grad = self.backward_node.post_process_node.backward(output_grad)
         output_grad = self.backward_node.combine_node.backward(output_grad)
 
