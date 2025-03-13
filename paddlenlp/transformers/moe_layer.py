@@ -282,7 +282,9 @@ class MoELayer(nn.Layer):
 
 
 class MoEFlexTokenLayer(nn.Layer):
-    def __init__(self, config, moe_num_experts, expert_class, expert_kwargs, gate, moe_group):
+    def __init__(
+        self, config, moe_num_experts, expert_class, expert_kwargs, gate, moe_group, deepep_async_finish=False
+    ):
 
         super().__init__()
         self.config = config
@@ -292,7 +294,7 @@ class MoEFlexTokenLayer(nn.Layer):
         self.moe_num_experts = moe_num_experts
         self.num_local_experts = moe_num_experts // self.ep_size
         self.token_dispatcher = MoEFlexTokenDispatcher(
-            self.num_local_experts, self.moe_router_topk, self.moe_num_experts, moe_group
+            self.num_local_experts, self.moe_router_topk, self.moe_num_experts, moe_group, deepep_async_finish
         )
 
         self.experts = nn.LayerList([expert_class(**expert_kwargs)] * self.num_local_experts)
@@ -333,27 +335,50 @@ class MoEFlexTokenLayer(nn.Layer):
         probs, routing_map, l_aux, l_zloss = self.router(hidden_states)
         return probs, routing_map, l_aux, l_zloss
 
-    def dispatch_comm(self, hidden_states, probs, routing_map):
+    def pre_dispatch_compute(self, hidden_states, probs, routing_map):
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view([-1, self.hidden_shape[-1]])
+
+        num_tokens = routing_map.shape[0]
+
+        routing_map = routing_map.reshape([num_tokens, self._comm_manager.num_experts])
+        probs = probs.reshape([num_tokens, self._comm_manager.num_experts])
+        # Convert the format of routing map from multihot to indices.
+        token_probs, token_indices = paddle.topk(probs, self._comm_manager.router_topk, axis=-1)
+        return hidden_states, token_indices, token_probs
+
+    def dispatch_comm(self, hidden_states, token_indices, token_probs):
         (
-            dispatched_input,
+            hidden_states,
             tokens_per_expert,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
+            dispatched_indices,
             dispatched_probs,
-        ) = self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
+        ) = self._comm_manager.dispatch(hidden_states, token_indices, token_probs)
         return (
-            dispatched_input,
+            hidden_states,
             tokens_per_expert,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
+            dispatched_indices,
             dispatched_probs,
         )
 
-    def mlp_compute(self, dispatched_input, tokens_per_expert):
-        return self.expert_forward(dispatched_input, tokens_per_expert)
-
-    def combine_comm(self, expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs):
-        output, _ = self.token_dispatcher.token_unpermutation(
-            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs, None
+    def mlp_compute(self, hidden_states, tokens_per_expert, dispatched_indices, dispatched_probs):
+        (
+            global_input_tokens,
+            dispatched_routing_map,
+            dispatched_probs,
+            reversed_mapping_for_combine,
+        ) = self._comm_manager.get_permuted_hidden_states_by_experts(
+            hidden_states, dispatched_indices, dispatched_probs
         )
-        return output
+        expert_out = self.expert_forward(global_input_tokens, tokens_per_expert)
+        hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(
+            expert_out, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs
+        )
+        return hidden_states
+
+    def combine_comm(self, hidden_states):
+        hidden_states = self._comm_manager.combine(hidden_states)
+        return hidden_states
+
+    def after_combine_compute(self, hidden_states):
+        return hidden_states.reshape(self.hidden_shape)

@@ -42,6 +42,11 @@ from .modeling import (
     DeepseekV2RMSNorm,
 )
 
+try:
+    import paddle.distributed.communication.deep_ep as deep_ep
+except ImportError:
+    deep_ep = None
+
 __all__ = [
     "DeepseekV2ForCausalLMPipe",
 ]
@@ -99,9 +104,21 @@ def get_attr(layer, name):
         return get_attr(layer._layer, name)
 
 
+def calc_stream_wait(group_id):
+    comm_event = deep_ep.get_event_from_comm_stream(group_id)
+    comm_event.calc_stream_wait(group_id)
+
+
 class TransformerLayerNode(ScheduleNode):
     def __init__(
-        self, attn_and_gate_node, dispatch_node, mlp_node, combine_node, post_process_node, name="TransformerLayerNode"
+        self,
+        attn_and_gate_node,
+        dispatch_node,
+        mlp_node,
+        combine_node,
+        post_process_node,
+        moe_group,
+        name="TransformerLayerNode",
     ):
         super().__init__(fwd_func=None, name=name)
         assert isinstance(attn_and_gate_node, ScheduleNode)
@@ -115,11 +132,19 @@ class TransformerLayerNode(ScheduleNode):
         self.combine_node = combine_node
         self.post_process_node = post_process_node
 
+        self.moe_group = moe_group
+
     def forward(self, inputs):
         inputs = self.attn_and_gate_node.forward(inputs)
         inputs = self.dispatch_node.forward(inputs)
+
+        calc_stream_wait(self.moe_group.id)
+
         inputs = self.mlp_node.forward(inputs)
         inputs = self.combine_node.forward(inputs)
+
+        calc_stream_wait(self.moe_group.id)
+
         inputs = self.post_process_node.forward(inputs)
         return inputs
 
@@ -127,8 +152,14 @@ class TransformerLayerNode(ScheduleNode):
         assert (output_grad is not None) and (scaler is None)
         output_grad = self.post_process_node.backward(output_grad)
         output_grad = self.combine_node.backward(output_grad)
+
+        calc_stream_wait(self.moe_group.id)
+
         output_grad = self.mlp_node.backward(output_grad)
         output_grad = self.dispatch_node.backward(output_grad)
+
+        calc_stream_wait(self.moe_group.id)
+
         output_grad = self.attn_and_gate_node.backward(output_grad)
         return output_grad
 
@@ -155,18 +186,27 @@ class OverlapedScheduleNode:
 
     def forward_backward(self, inputs, output_grad):
         output_grad = self.backward_node.post_process_node.backward(output_grad)
+
         output_grad = self.backward_node.combine_node.backward(output_grad)
-
         inputs = self.forward_node.attn_and_gate_node.forward(inputs)
+
+        calc_stream_wait(self.backward_node.moe_group.id)
+
         inputs = self.forward_node.dispatch_node.forward(inputs)
-
         output_grad = self.backward_node.mlp_node.backward(output_grad)
+
+        calc_stream_wait(self.forward_node.moe_group.id)
+
         output_grad = self.backward_node.dispatch_node.backward(output_grad)
-
         inputs = self.forward_node.mlp_node.forward(inputs)
-        inputs = self.forward_node.combine_node.forward(inputs)
 
+        calc_stream_wait(self.backward_node.moe_group.id)
+
+        inputs = self.forward_node.combine_node.forward(inputs)
         output_grad = self.backward_node.attn_and_gate_node.backward(output_grad)
+
+        calc_stream_wait(self.forward_node.moe_group.id)
+
         inputs = self.forward_node.post_process_node.forward(inputs)
         return inputs, output_grad
 
@@ -383,42 +423,53 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             inputs_embeds_mtp = hidden_states[-batch_size_mtp:, :, :]
             hidden_states = hidden_states[:batch_size_mtp, :, :]
 
-        hidden_states, residual, _, _ = self.self_attn_compute(
+        ori_hidden_states, residual, _, _ = self.self_attn_compute(
             hidden_states,
             position_ids=position_ids,
             attention_mask=attention_mask,
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
         )
-        probs, routing_map, l_aux, _ = self.mlp.gate_compute(hidden_states)
+        probs, routing_map, l_aux, _ = self.mlp.gate_compute(ori_hidden_states)
+        hidden_states, token_indices, token_probs = self.mlp.pre_dispatch_compute(hidden_states, probs, routing_map)
         return (
             inputs_embeds_mtp,
-            hidden_states,
+            ori_hidden_states,
             residual,
             probs,
-            routing_map,
             l_aux,
+            hidden_states,
+            token_indices,
+            token_probs,
         )
 
     def dispatch_comm(self, input):
         if isinstance(input, list):
             input = tuple(input)
-        (inputs_embeds_mtp, hidden_states, residual, probs, routing_map, l_aux) = input
         (
-            dispatched_input,
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            hidden_states,
+            token_indices,
+            token_probs,
+        ) = input
+        (
+            hidden_states,
             tokens_per_expert,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
+            dispatched_indices,
             dispatched_probs,
-        ) = self.mlp.dispatch_comm(hidden_states, probs, routing_map)
+        ) = self.mlp.dispatch_comm(hidden_states, token_indices, token_probs)
         return (
             inputs_embeds_mtp,
-            hidden_states,
+            ori_hidden_states,
             residual,
+            probs,
             l_aux,
-            dispatched_input,
+            hidden_states,
             tokens_per_expert,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
+            dispatched_indices,
             dispatched_probs,
         )
 
@@ -427,24 +478,22 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             input = tuple(input)
         (
             inputs_embeds_mtp,
-            hidden_states,
+            ori_hidden_states,
             residual,
+            probs,
             l_aux,
-            dispatched_input,
+            hidden_states,
             tokens_per_expert,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
+            dispatched_indices,
             dispatched_probs,
         ) = input
-        expert_output = self.mlp.mlp_compute(dispatched_input, tokens_per_expert)
+        expert_output = self.mlp.mlp_compute(hidden_states, tokens_per_expert, dispatched_indices, dispatched_probs)
         return (
             inputs_embeds_mtp,
-            hidden_states,
+            ori_hidden_states,
             residual,
+            probs,
             l_aux,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
-            dispatched_probs,
             expert_output,
         )
 
@@ -453,24 +502,36 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             input = tuple(input)
         (
             inputs_embeds_mtp,
-            hidden_states,
+            ori_hidden_states,
             residual,
+            probs,
             l_aux,
-            reversed_mapping_for_combine,
-            dispatched_routing_map,
-            dispatched_probs,
             expert_output,
         ) = input
-        combine_output = self.mlp.combine_comm(
-            expert_output, reversed_mapping_for_combine, dispatched_routing_map, dispatched_probs
+        combine_output = self.mlp.combine_comm(expert_output)
+        return (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            expert_output,
+            combine_output,
         )
-        return (inputs_embeds_mtp, hidden_states, residual, l_aux, combine_output)
 
     def post_process_compute(self, input):
         if isinstance(input, list):
             input = tuple(input)
-        (inputs_embeds_mtp, hidden_states, residual, l_aux, combine_output) = input
-        hidden_states = self.mlp.auxilibaryloss_and_shared_expert_compute(hidden_states, combine_output, l_aux)
+        (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            expert_output,
+            combine_output,
+        ) = input
+        hidden_states = self.mlp.auxilibaryloss_and_shared_expert_compute(ori_hidden_states, combine_output, l_aux)
         hidden_states = residual + hidden_states
         hidden_states = self.post_process_output(hidden_states, False, False, None, None)
         if self.config.num_nextn_predict_layers > 0:
@@ -490,6 +551,7 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             mlp_node=mlp_node,
             combine_node=combine_node,
             post_process_node=post_process_node,
+            moe_group=self.mlp.moe_group,
             name="DeepseekV2DecoderLayerPipe",
         )
 
@@ -714,6 +776,7 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
                     config=config,
                     layer_idx=i,
                     layerwise_recompute=i not in self.no_recompute_layers,
+                    deepep_async_finish=use_dualpipev,
                 ),
                 f"{self._base_model.base_model_prefix}.layers.{i}",
             )

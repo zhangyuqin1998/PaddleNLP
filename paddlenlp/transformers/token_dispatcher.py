@@ -50,11 +50,13 @@ class _DeepepManager:
         router_topk: int,
         num_experts: int = None,
         num_local_experts: int = None,
+        async_finish: bool = False,
     ):
         self.group = group
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
+        self.async_finish = async_finish
 
         if fused_dispatch is None:
             raise ImportError("DeepEP is not supported in your paddlepaddle whl package.")
@@ -63,7 +65,12 @@ class _DeepepManager:
         self, hidden_states: paddle.Tensor, token_indices: paddle.Tensor, token_probs: paddle.Tensor
     ) -> paddle.Tensor:
         hidden_states, dispatched_probs, states = fused_dispatch(
-            hidden_states, token_indices, token_probs, self.num_experts, self.group
+            hidden_states,
+            token_indices,
+            token_probs,
+            self.num_experts,
+            self.group,
+            self.async_finish,
         )
         self.handle = states["handle"]
         tokens_per_expert = states["tokens_per_expert"]
@@ -98,7 +105,7 @@ class _DeepepManager:
         return multihot_routing_map.cast(paddle.bool), multihot_probs
 
     def combine(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
-        hidden_states = fused_combine(hidden_states, self.group, self.handle)
+        hidden_states = fused_combine(hidden_states, self.group, self.handle, self.async_finish)
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(
@@ -133,7 +140,14 @@ class MoEFlexTokenDispatcher:
     Flexible token dispatcher for MoE models with Efficient-A2A communication kernels.
     """
 
-    def __init__(self, num_local_experts: int, moe_router_topk: int, num_moe_experts: int, ep_group: Group):
+    def __init__(
+        self,
+        num_local_experts: int,
+        moe_router_topk: int,
+        num_moe_experts: int,
+        ep_group: Group,
+        async_finish: int = False,
+    ):
 
         self._ep_group = ep_group
         self.num_local_experts = num_local_experts
@@ -143,6 +157,7 @@ class MoEFlexTokenDispatcher:
             router_topk=moe_router_topk,
             num_experts=num_moe_experts,
             num_local_experts=self.num_local_experts,
+            async_finish=async_finish,
         )
 
     @property

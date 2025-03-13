@@ -813,7 +813,7 @@ class DeepseekV2MoEFlexToken(MoEFlexTokenLayer):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config: DeepseekV2Config):
+    def __init__(self, config: DeepseekV2Config, deepep_async_finish: bool = False):
         gate = MoEGate(
             config=config,
             num_experts=config.n_routed_experts,
@@ -838,6 +838,7 @@ class DeepseekV2MoEFlexToken(MoEFlexTokenLayer):
             expert_kwargs={"config": config, "intermediate_size": config.moe_intermediate_size, "is_moe": True},
             gate=gate,
             moe_group=moe_group,
+            deepep_async_finish=deepep_async_finish,
         )
 
         for p in self.experts.parameters():
@@ -1147,7 +1148,13 @@ class DeepseekV2Attention(nn.Layer):
 
 
 class DeepseekV2DecoderLayer(nn.Layer):
-    def __init__(self, config: DeepseekV2Config, layer_idx: int, layerwise_recompute: bool = False):
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        layer_idx: int,
+        layerwise_recompute: bool = False,
+        deepep_async_finish: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -1159,17 +1166,18 @@ class DeepseekV2DecoderLayer(nn.Layer):
 
         self.self_attn = DeepseekV2Attention(config=config, layerwise_recompute=layerwise_recompute)
 
-        MoELayerClass = DeepseekV2MoEFlexToken if config.using_flex_token else DeepseekV2MoE
+        if (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            if config.using_flex_token:
+                self.mlp = DeepseekV2MoEFlexToken(config, deepep_async_finish)
+            else:
+                self.mlp = DeepseekV2MoE(config)
+        else:
+            self.mlp = DeepseekV2MLP(config)
 
-        self.mlp = (
-            MoELayerClass(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0
-            )
-            else DeepseekV2MLP(config)
-        )
         self.input_layernorm = DeepseekV2RMSNorm(config)
         self.post_attention_layernorm = DeepseekV2RMSNorm(config)
 
