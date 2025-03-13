@@ -47,6 +47,8 @@ try:
 except ImportError:
     deep_ep = None
 
+from functools import partial
+
 __all__ = [
     "DeepseekV2ForCausalLMPipe",
 ]
@@ -109,7 +111,7 @@ def calc_stream_wait(group_id):
     comm_event.calc_stream_wait(group_id)
 
 
-class TransformerLayerNode(ScheduleNode):
+class DecoderLayerNode(ScheduleNode):
     def __init__(
         self,
         attn_and_gate_node,
@@ -118,7 +120,7 @@ class TransformerLayerNode(ScheduleNode):
         combine_node,
         post_process_node,
         moe_group,
-        name="TransformerLayerNode",
+        name="DecoderLayerNode",
     ):
         super().__init__(fwd_func=None, name=name)
         assert isinstance(attn_and_gate_node, ScheduleNode)
@@ -150,17 +152,15 @@ class TransformerLayerNode(ScheduleNode):
 
     def backward(self, output_grad=None, scaler=None):
         assert (output_grad is not None) and (scaler is None)
+
         output_grad = self.post_process_node.backward(output_grad)
         output_grad = self.combine_node.backward(output_grad)
-
-        calc_stream_wait(self.moe_group.id)
 
         output_grad = self.mlp_node.backward(output_grad)
         output_grad = self.dispatch_node.backward(output_grad)
 
-        calc_stream_wait(self.moe_group.id)
-
         output_grad = self.attn_and_gate_node.backward(output_grad)
+        paddle.device.synchronize()
         return output_grad
 
 
@@ -179,12 +179,15 @@ class OverlapedScheduleChunk:
 
 class OverlapedScheduleNode:
     def __init__(self, forward_node, backward_node, name=""):
-        assert isinstance(forward_node, TransformerLayerNode) and isinstance(backward_node, TransformerLayerNode)
+        assert isinstance(forward_node, DecoderLayerNode) and isinstance(backward_node, DecoderLayerNode)
         self.forward_node = forward_node
         self.backward_node = backward_node
         self.name = name
 
     def forward_backward(self, inputs, output_grad):
+        self.backward_node.combine_async_hooks.post_backward_hook = partial(calc_stream_wait, self.moe_group.id)
+        self.backward_node.dispatch_async_hooks.post_backward_hook = partial(calc_stream_wait, self.moe_group.id)
+
         output_grad = self.backward_node.post_process_node.backward(output_grad)
 
         output_grad = self.backward_node.combine_node.backward(output_grad)
@@ -216,10 +219,10 @@ def build_overlapped_nodes(forward_chunk, backward_chunk):
     backward_decoder_layer_num = 0
     assert isinstance(forward_chunk, ScheduleChunk) and isinstance(backward_chunk, ScheduleChunk)
     for n in forward_chunk.nodes:
-        if isinstance(n, TransformerLayerNode):
+        if isinstance(n, DecoderLayerNode):
             forward_decoder_layer_num += 1
     for n in reversed(backward_chunk.nodes):
-        if isinstance(n, TransformerLayerNode):
+        if isinstance(n, DecoderLayerNode):
             backward_decoder_layer_num += 1
 
     overlap_layers_num = min(forward_decoder_layer_num, backward_decoder_layer_num)
@@ -228,7 +231,7 @@ def build_overlapped_nodes(forward_chunk, backward_chunk):
     forward_overlap_layers = []
     is_pre = True
     for n in forward_chunk.nodes:
-        if not isinstance(n, TransformerLayerNode):
+        if not isinstance(n, DecoderLayerNode):
             if is_pre:
                 forward_pre_overlap_layers.append(n)
             else:
@@ -247,7 +250,7 @@ def build_overlapped_nodes(forward_chunk, backward_chunk):
     backward_overlap_layers = []
     is_pre = True
     for n in reversed(backward_chunk.nodes):
-        if not isinstance(n, TransformerLayerNode):
+        if not isinstance(n, DecoderLayerNode):
             if is_pre:
                 backward_pre_overlap_layers.append(n)
             else:
@@ -531,6 +534,7 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             expert_output,
             combine_output,
         ) = input
+        combine_output = self.mlp.post_combine_compute(combine_output)
         hidden_states = self.mlp.auxilibaryloss_and_shared_expert_compute(ori_hidden_states, combine_output, l_aux)
         hidden_states = residual + hidden_states
         hidden_states = self.post_process_output(hidden_states, False, False, None, None)
@@ -545,7 +549,7 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         mlp_node = ScheduleNode(self.mlp_compute, name="mlp_node")
         combine_node = ScheduleNode(self.combine_comm, name="combine_node")
         post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
-        return TransformerLayerNode(
+        return DecoderLayerNode(
             attn_and_gate_node=attn_and_gate_node,
             dispatch_node=dispatch_node,
             mlp_node=mlp_node,
@@ -825,7 +829,7 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
                 "partition": False,
             },
             num_virtual_pipeline_stages=virtual_pp_degree,
-            use_dualpipev=use_dualpipev,
+            use_dualpipev=use_dualpipev and hasattr(self, "overlapped_forward_backward"),
         )
         # You should call init here, since there is a  diamond inheritance problem
         self.apply(self._init_weights)
@@ -835,7 +839,43 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     def get_loss_fn(self, config):
         return DeepseekV2PretrainingCriterionPipe(config)
 
-    def _overlapped_forward_backward(
+    # def overlapped_forward_backward(
+    #     self,
+    #     forward_chunk,  # the module of the forward chunk
+    #     forward_inputs,
+    #     forward_loss_fn_node,
+    #     backward_chunk,  # the module of the backward chunk, maybe not used
+    #     backward_loss_fn_node,
+    #     backward_input_grads,
+    #     scaler,
+    # ):
+    #     if backward_loss_fn_node is not None:
+    #         if scaler:
+    #             backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
+    #         else:
+    #             backward_input_grads = backward_loss_fn_node.backward()
+
+    #     (
+    #         forward_pre_node,
+    #         backward_pre_node,
+    #         overlap_node,
+    #         forward_post_node,
+    #         backward_post_node,
+    #     ) = build_overlapped_nodes(forward_chunk, backward_chunk)
+    #     forward_inputs = forward_pre_node.forward(forward_inputs)
+    #     backward_input_grads = backward_pre_node.backward(backward_input_grads)
+    #     forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
+    #     forward_inputs = forward_post_node.forward(forward_inputs)
+    #     backward_input_grads = backward_post_node.backward(backward_input_grads)
+
+    #     if forward_loss_fn_node is not None:
+    #         forward_loss = forward_loss_fn_node.forward(forward_inputs)
+    #     else:
+    #         forward_loss = None
+
+    #     return forward_inputs, forward_loss, backward_input_grads
+
+    def overlapped_forward_backward(
         self,
         forward_chunk,  # the module of the forward chunk
         forward_inputs,
@@ -845,28 +885,18 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         backward_input_grads,
         scaler,
     ):
+        forward_outputs = forward_chunk.forward(forward_inputs)
+        forward_outputs = [forward_outputs] if isinstance(forward_outputs, paddle.Tensor) else forward_outputs
+
+        if forward_loss_fn_node is not None:
+            forward_loss = forward_loss_fn_node.forward(forward_outputs)
+        else:
+            forward_loss = None
+
         if backward_loss_fn_node is not None:
             if scaler:
                 backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
             else:
                 backward_input_grads = backward_loss_fn_node.backward()
-
-        (
-            forward_pre_node,
-            backward_pre_node,
-            overlap_node,
-            forward_post_node,
-            backward_post_node,
-        ) = build_overlapped_nodes(forward_chunk, backward_chunk)
-        forward_inputs = forward_pre_node.forward(forward_inputs)
-        backward_input_grads = backward_pre_node.backward(backward_input_grads)
-        forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
-        forward_inputs = forward_post_node.forward(forward_inputs)
-        backward_input_grads = backward_post_node.backward(backward_input_grads)
-
-        if forward_loss_fn_node is not None:
-            forward_loss = forward_loss_fn_node.forward(forward_inputs)
-        else:
-            forward_loss = None
-
-        return forward_inputs, forward_loss, backward_input_grads
+        backward_input_grads = backward_chunk.backward(backward_input_grads)
+        return forward_outputs, forward_loss, backward_input_grads
