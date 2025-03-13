@@ -47,7 +47,12 @@ try:
 except ImportError:
     deep_ep = None
 
-from functools import partial
+from paddlenlp.transformers.fused_a2a import (
+    FusedCombine_backward,
+    FusedCombine_forward,
+    FusedDispatch_backward,
+    FusedDispatch_forward,
+)
 
 __all__ = [
     "DeepseekV2ForCausalLMPipe",
@@ -115,38 +120,87 @@ class DecoderLayerNode(ScheduleNode):
     def __init__(
         self,
         attn_and_gate_node,
-        dispatch_node,
         mlp_node,
-        combine_node,
         post_process_node,
         moe_group,
         name="DecoderLayerNode",
     ):
         super().__init__(fwd_func=None, name=name)
         assert isinstance(attn_and_gate_node, ScheduleNode)
-        assert isinstance(dispatch_node, ScheduleNode)
+        # assert isinstance(dispatch_node, ScheduleNode)
         assert isinstance(mlp_node, ScheduleNode)
-        assert isinstance(combine_node, ScheduleNode)
+        # assert isinstance(combine_node, ScheduleNode)
         assert isinstance(post_process_node, ScheduleNode)
         self.attn_and_gate_node = attn_and_gate_node
-        self.dispatch_node = dispatch_node
+        # self.dispatch_node = dispatch_node
         self.mlp_node = mlp_node
-        self.combine_node = combine_node
+        # self.combine_node = combine_node
         self.post_process_node = post_process_node
 
         self.moe_group = moe_group
 
+        self.states = None
+
     def forward(self, inputs):
         inputs = self.attn_and_gate_node.forward(inputs)
-        inputs = self.dispatch_node.forward(inputs)
 
-        calc_stream_wait(self.moe_group.id)
+        (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            hidden_states,
+            token_indices,
+            token_probs,
+        ) = inputs
+
+        with paddle.no_grad():
+            hidden_states, dispatched_probs, states = FusedDispatch_forward(
+                hidden_states, token_indices, token_probs, 8, self.moe_group
+            )
+        tokens_per_expert = states["tokens_per_expert"]
+        dispatched_indices = states["dispatched_indices"]
+        # tokens_per_expert.stop_gradient = False
+        # dispatched_indices.stop_gradient = False
+        hidden_states.stop_gradient = False
+        dispatched_probs.stop_gradient = False
+        self.states = states
+
+        inputs = (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            hidden_states,
+            tokens_per_expert,
+            dispatched_indices,
+            dispatched_probs,
+        )
 
         inputs = self.mlp_node.forward(inputs)
-        inputs = self.combine_node.forward(inputs)
 
-        calc_stream_wait(self.moe_group.id)
+        (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            expert_output,
+        ) = inputs
 
+        with paddle.no_grad():
+            combine_output = FusedCombine_forward(expert_output, self.moe_group, self.states)
+        combine_output.stop_gradient = False
+        inputs = (
+            inputs_embeds_mtp,
+            ori_hidden_states,
+            residual,
+            probs,
+            l_aux,
+            combine_output,
+        )
         inputs = self.post_process_node.forward(inputs)
         return inputs
 
@@ -154,13 +208,59 @@ class DecoderLayerNode(ScheduleNode):
         assert (output_grad is not None) and (scaler is None)
 
         output_grad = self.post_process_node.backward(output_grad)
-        output_grad = self.combine_node.backward(output_grad)
+
+        (
+            inputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            combine_output_grad,
+        ) = output_grad
+
+        with paddle.no_grad():
+            expert_output_grad = FusedCombine_backward(self.moe_group, self.states["handle"], combine_output_grad)
+
+        output_grad = (
+            inputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            expert_output_grad,
+        )
 
         output_grad = self.mlp_node.backward(output_grad)
-        output_grad = self.dispatch_node.backward(output_grad)
+
+        (
+            nputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            hidden_states_grad,
+            tokens_per_expert_grad,
+            dispatched_indices_grad,
+            dispatched_probs_grad,
+        ) = output_grad
+
+        with paddle.no_grad():
+            hidden_states_grad, token_indices_grad, token_probs_grad = FusedDispatch_backward(
+                self.moe_group, self.states["handle"], hidden_states_grad, dispatched_probs_grad
+            )
+
+        output_grad = (
+            inputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            hidden_states_grad,
+            token_indices_grad,
+            token_probs_grad,
+        )
 
         output_grad = self.attn_and_gate_node.backward(output_grad)
-        paddle.device.synchronize()
         return output_grad
 
 
@@ -185,9 +285,6 @@ class OverlapedScheduleNode:
         self.name = name
 
     def forward_backward(self, inputs, output_grad):
-        self.backward_node.combine_async_hooks.post_backward_hook = partial(calc_stream_wait, self.moe_group.id)
-        self.backward_node.dispatch_async_hooks.post_backward_hook = partial(calc_stream_wait, self.moe_group.id)
-
         output_grad = self.backward_node.post_process_node.backward(output_grad)
 
         output_grad = self.backward_node.combine_node.backward(output_grad)
@@ -518,7 +615,6 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             residual,
             probs,
             l_aux,
-            expert_output,
             combine_output,
         )
 
@@ -531,7 +627,6 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
             residual,
             probs,
             l_aux,
-            expert_output,
             combine_output,
         ) = input
         combine_output = self.mlp.post_combine_compute(combine_output)
@@ -545,15 +640,13 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
 
     def build_schedule_node(self):
         attn_and_gate_node = ScheduleNode(self.self_attn_and_gate_compute, name="attn_and_gate_node")
-        dispatch_node = ScheduleNode(self.dispatch_comm, name="dispatch_node")
+        # dispatch_node = ScheduleNode(None, self.dispatch, name="dispatch_node")
         mlp_node = ScheduleNode(self.mlp_compute, name="mlp_node")
-        combine_node = ScheduleNode(self.combine_comm, name="combine_node")
+        # combine_node = ScheduleNode(None, self.combine, name="combine_node")
         post_process_node = ScheduleNode(self.post_process_compute, name="post_process_node")
         return DecoderLayerNode(
             attn_and_gate_node=attn_and_gate_node,
-            dispatch_node=dispatch_node,
             mlp_node=mlp_node,
-            combine_node=combine_node,
             post_process_node=post_process_node,
             moe_group=self.mlp.moe_group,
             name="DeepseekV2DecoderLayerPipe",
