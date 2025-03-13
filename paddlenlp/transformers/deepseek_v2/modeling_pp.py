@@ -141,9 +141,7 @@ class DecoderLayerNode(ScheduleNode):
 
         self.states = None
 
-    def forward(self, inputs):
-        inputs = self.attn_and_gate_node.forward(inputs)
-
+    def dispatch_forward(self, inputs):
         (
             inputs_embeds_mtp,
             ori_hidden_states,
@@ -178,9 +176,9 @@ class DecoderLayerNode(ScheduleNode):
             dispatched_indices,
             dispatched_probs,
         )
+        return inputs
 
-        inputs = self.mlp_node.forward(inputs)
-
+    def combine_forward(self, inputs):
         (
             inputs_embeds_mtp,
             ori_hidden_states,
@@ -201,39 +199,11 @@ class DecoderLayerNode(ScheduleNode):
             l_aux,
             combine_output,
         )
-        inputs = self.post_process_node.forward(inputs)
         return inputs
 
-    def backward(self, output_grad=None, scaler=None):
-        assert (output_grad is not None) and (scaler is None)
-
-        output_grad = self.post_process_node.backward(output_grad)
-
+    def dispatch_backward(self, output_grad):
         (
             inputs_embeds_mtp_grad,
-            ori_hidden_states_grad,
-            residual_grad,
-            probs_grad,
-            l_aux_grad,
-            combine_output_grad,
-        ) = output_grad
-
-        with paddle.no_grad():
-            expert_output_grad = FusedCombine_backward(self.moe_group, self.states["handle"], combine_output_grad)
-
-        output_grad = (
-            inputs_embeds_mtp_grad,
-            ori_hidden_states_grad,
-            residual_grad,
-            probs_grad,
-            l_aux_grad,
-            expert_output_grad,
-        )
-
-        output_grad = self.mlp_node.backward(output_grad)
-
-        (
-            nputs_embeds_mtp_grad,
             ori_hidden_states_grad,
             residual_grad,
             probs_grad,
@@ -259,6 +229,57 @@ class DecoderLayerNode(ScheduleNode):
             token_indices_grad,
             token_probs_grad,
         )
+        return output_grad
+
+    def combine_backward(self, output_grad):
+        (
+            inputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            combine_output_grad,
+        ) = output_grad
+
+        with paddle.no_grad():
+            expert_output_grad = FusedCombine_backward(self.moe_group, self.states["handle"], combine_output_grad)
+
+        output_grad = (
+            inputs_embeds_mtp_grad,
+            ori_hidden_states_grad,
+            residual_grad,
+            probs_grad,
+            l_aux_grad,
+            expert_output_grad,
+        )
+        return output_grad
+
+    def forward(self, inputs):
+        inputs = self.attn_and_gate_node.forward(inputs)
+
+        inputs = self.dispatch_forward(inputs)
+        calc_stream_wait(self.moe_group.id)
+
+        inputs = self.mlp_node.forward(inputs)
+
+        inputs = self.combine_forward(inputs)
+        calc_stream_wait(self.moe_group.id)
+
+        inputs = self.post_process_node.forward(inputs)
+        return inputs
+
+    def backward(self, output_grad=None, scaler=None):
+        assert (output_grad is not None) and (scaler is None)
+
+        output_grad = self.post_process_node.backward(output_grad)
+
+        output_grad = self.combine_backward(output_grad)
+        calc_stream_wait(self.moe_group.id)
+
+        output_grad = self.mlp_node.backward(output_grad)
+
+        output_grad = self.dispatch_backward(output_grad)
+        calc_stream_wait(self.moe_group.id)
 
         output_grad = self.attn_and_gate_node.backward(output_grad)
         return output_grad
