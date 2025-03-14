@@ -1000,42 +1000,6 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     def get_loss_fn(self, config):
         return DeepseekV2PretrainingCriterionPipe(config)
 
-    # def overlapped_forward_backward(
-    #     self,
-    #     forward_chunk,  # the module of the forward chunk
-    #     forward_inputs,
-    #     forward_loss_fn_node,
-    #     backward_chunk,  # the module of the backward chunk, maybe not used
-    #     backward_loss_fn_node,
-    #     backward_input_grads,
-    #     scaler,
-    # ):
-    #     if backward_loss_fn_node is not None:
-    #         if scaler:
-    #             backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
-    #         else:
-    #             backward_input_grads = backward_loss_fn_node.backward()
-
-    #     (
-    #         forward_pre_node,
-    #         backward_pre_node,
-    #         overlap_node,
-    #         forward_post_node,
-    #         backward_post_node,
-    #     ) = build_overlapped_nodes(forward_chunk, backward_chunk)
-    #     forward_inputs = forward_pre_node.forward(forward_inputs)
-    #     backward_input_grads = backward_pre_node.backward(backward_input_grads)
-    #     forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
-    #     forward_inputs = forward_post_node.forward(forward_inputs)
-    #     backward_input_grads = backward_post_node.backward(backward_input_grads)
-
-    #     if forward_loss_fn_node is not None:
-    #         forward_loss = forward_loss_fn_node.forward(forward_inputs)
-    #     else:
-    #         forward_loss = None
-
-    #     return forward_inputs, forward_loss, backward_input_grads
-
     def overlapped_forward_backward(
         self,
         forward_chunk,  # the module of the forward chunk
@@ -1046,18 +1010,54 @@ class DeepseekV2ForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         backward_input_grads,
         scaler,
     ):
-        forward_outputs = forward_chunk.forward(forward_inputs)
-        forward_outputs = [forward_outputs] if isinstance(forward_outputs, paddle.Tensor) else forward_outputs
-
-        if forward_loss_fn_node is not None:
-            forward_loss = forward_loss_fn_node.forward(forward_outputs)
-        else:
-            forward_loss = None
-
         if backward_loss_fn_node is not None:
             if scaler:
                 backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
             else:
                 backward_input_grads = backward_loss_fn_node.backward()
-        backward_input_grads = backward_chunk.backward(backward_input_grads)
-        return forward_outputs, forward_loss, backward_input_grads
+
+        (
+            forward_pre_node,
+            backward_pre_node,
+            overlap_node,
+            forward_post_node,
+            backward_post_node,
+        ) = build_overlapped_nodes(forward_chunk, backward_chunk)
+        forward_inputs = forward_pre_node.forward(forward_inputs)
+        backward_input_grads = backward_pre_node.backward(backward_input_grads)
+        forward_inputs, backward_input_grads = overlap_node.forward_backward(forward_inputs, backward_input_grads)
+        forward_inputs = forward_post_node.forward(forward_inputs)
+        backward_input_grads = backward_post_node.backward(backward_input_grads)
+
+        if forward_loss_fn_node is not None:
+            forward_loss = forward_loss_fn_node.forward(forward_inputs)
+        else:
+            forward_loss = None
+
+        return forward_inputs, forward_loss, backward_input_grads
+
+    # def overlapped_forward_backward(
+    #     self,
+    #     forward_chunk,  # the module of the forward chunk
+    #     forward_inputs,
+    #     forward_loss_fn_node,
+    #     backward_chunk,  # the module of the backward chunk, maybe not used
+    #     backward_loss_fn_node,
+    #     backward_input_grads,
+    #     scaler,
+    # ):
+    #     forward_outputs = forward_chunk.forward(forward_inputs)
+    #     forward_outputs = [forward_outputs] if isinstance(forward_outputs, paddle.Tensor) else forward_outputs
+
+    #     if forward_loss_fn_node is not None:
+    #         forward_loss = forward_loss_fn_node.forward(forward_outputs)
+    #     else:
+    #         forward_loss = None
+
+    #     if backward_loss_fn_node is not None:
+    #         if scaler:
+    #             backward_input_grads = backward_loss_fn_node.backward(scaler=scaler)
+    #         else:
+    #             backward_input_grads = backward_loss_fn_node.backward()
+    #     backward_input_grads = backward_chunk.backward(backward_input_grads)
+    #     return forward_outputs, forward_loss, backward_input_grads
